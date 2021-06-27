@@ -4,6 +4,26 @@
 #include "PubSubClient.h"
 #include <WiFi.h>
 
+#define BUTTON_CH 1
+#define CALL_TIMEOUT 600000
+#define IDLE_TIMEOUT 40000
+#define TERM_TIMEOUT 5000
+
+enum StateEnum {SLEEP, CALL, TERM};
+typedef enum StateEnum State;
+
+State curState = CALL;
+unsigned long lastData_ms = 0;
+unsigned long callBegin_ms = 0;
+unsigned long termBegin_ms = 0;
+
+bool isTimeout(unsigned long ms, unsigned long timeout);
+
+bool prevButtonPressed = false;
+bool curButtonPressed = false;
+void updateButtonStatus();
+bool isButtonPressed();
+
 #define I2S_BCK  16
 #define I2S_WS   15
 #define I2S_DATA 13
@@ -26,13 +46,13 @@ unsigned long start_us = 0;
 hw_timer_t * timer = NULL;
 portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
 
-uint16_t readADC(byte ch, byte &e1, byte &e2);
+uint16_t readADC(byte ch, byte *e1, byte *e2);
 
 void IRAM_ATTR onTimer() {
     portENTER_CRITICAL_ISR(&timerMux);
 
-    if (!bufferFull) {
-        readADC(ADC_CH, adc[bufferN], adc[bufferN+1]);
+    if (curState == CALL && !bufferFull) {
+        readADC(ADC_CH, &adc[bufferN], &adc[bufferN+1]);
         bufferN += 2;
         if (bufferN >= ADC_BUFFER_LENGTH) {
             bufferN = 0;
@@ -52,7 +72,6 @@ WiFiClient espClient;
 PubSubClient client(espClient);
 
 void setup_wifi(); 
-uint32_t d; size_t bw;
 void callback(char* topic, byte* payload, unsigned int length); 
 void reconnect(); 
 
@@ -124,20 +143,47 @@ void setup()
 
 void loop()
 {
+    // manage MQTT connection. MUST-HAVE
     if (!client.connected()) {
         reconnect();
     }
     client.loop();
 
-    if (bufferFull) {
-        if (!client.publish("audioBell", adc, ADC_BUFFER_LENGTH, false)) {
-            Serial.println("Publish failed");
-        }    
-        bufferFull = false;
+    // manage device's state
+    // updateButtonStatus();
+    // if (isButtonPressed())
+    //     Serial.println("Button pressed!");
+    if (curState == SLEEP) {
+        if (isButtonPressed()) {
+            curState = CALL;
+            callBegin_ms = millis();
+            lastData_ms = millis();
+        }
+    } else if (curState == CALL) {
+        // send data
+        if (bufferFull) {
+            if (!client.publish("audioBell", adc, ADC_BUFFER_LENGTH, false)) {
+                Serial.println("Publish failed");
+            }
+            bufferFull = false;
+        }
+
+        // if (isTimeout(callBegin_ms, CALL_TIMEOUT)) {
+        //     curState = TERM;
+        //     termBegin_ms = millis();
+        // }
+        // else if (isTimeout(lastData_ms, IDLE_TIMEOUT))
+        //     curState = SLEEP;
+
+    } else if (curState == TERM) {
+        if (isTimeout(termBegin_ms, TERM_TIMEOUT))
+            curState = SLEEP;
+    } else {
+        Serial.println("???INVALID STATE???");
     }
 }
 
-uint16_t readADC(byte ch, byte &e1, byte &e2)
+uint16_t readADC(byte ch, byte *e1, byte *e2)
 {
     unsigned int dataIn = 0;
     unsigned int result = 0;
@@ -153,10 +199,11 @@ uint16_t readADC(byte ch, byte &e1, byte &e2)
     result = result | dataIn; //12-bit value
     result = ((result << 4) & (uint16_t)0xfff0) | ((result >> 8) & (uint16_t)0x000f); //16-bit value
     
-    e1 = result >> 8;
-    e2 = result & 0x00ff;
+    *e1 = result >> 8;
+    *e2 = result & 0x00ff;
 
     digitalWrite(ADC_SPI_CS, HIGH);
+
     return result;        
 }
 
@@ -184,12 +231,24 @@ void setup_wifi() {
 }
 
 void callback(char* topic, byte* payload, unsigned int length) {
-    for (unsigned int i = 0; i < length; i += 2) {
-        d = payload[i];
-        d <<= 8;
-        d |= payload[i+1];
-        d = (d << 16) | (d & 0xffff);
-        i2s_write(I2S_PORT, &d, 4, &bw, portMAX_DELAY);
+    if (strcmp(topic, "audioMaster") == 0) {
+        if (curState == SLEEP) {
+            curState = CALL;
+            callBegin_ms = millis();
+        }
+        if (curState == CALL) {
+            uint32_t d; size_t bw;
+            for (unsigned int i = 0; i < length; i += 2) {
+                d = payload[i];
+                d <<= 8;
+                d |= payload[i+1];
+                d = (d << 16) | (d & 0xffff);
+                // i2s_write(I2S_PORT, &d, 4, &bw, portMAX_DELAY);
+                i2s_write(I2S_PORT, &d, 4, &bw, 100);
+            }
+            // very important: update time of last packet received
+            // lastData_ms = millis();
+        }
     }
 }
 
@@ -215,4 +274,18 @@ void reconnect() {
         delay(5000);
     }
   }
+}
+
+bool isTimeout(unsigned long ms, unsigned long timeout) {
+    return millis() - ms >= timeout;
+}
+
+void updateButtonStatus() {
+    byte tmp1, tmp2;
+    prevButtonPressed = curButtonPressed;
+    curButtonPressed = readADC(BUTTON_CH, &tmp1, &tmp2) > 65000;
+}
+
+bool isButtonPressed() {
+    return curButtonPressed && !prevButtonPressed;
 }

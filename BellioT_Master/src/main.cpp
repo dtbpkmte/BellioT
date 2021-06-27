@@ -9,15 +9,35 @@
 #define _TIMERINTERRUPT_LOGLEVEL_ 0
 #include "ESP8266TimerInterrupt.h"
 
+#define BUTTON_CH 1
+#define CALL_TIMEOUT 600000
+#define IDLE_TIMEOUT 5000
+#define TERM_TIMEOUT 5000
+
+enum StateEnum {SLEEP, CALL, TERM};
+typedef enum StateEnum State;
+
+State curState = SLEEP;
+unsigned long lastData_ms = 0;
+unsigned long callBegin_ms = 0;
+unsigned long termBegin_ms = 0;
+
+bool isTimeout(unsigned long ms, unsigned long timeout);
+
+bool prevButtonPressed = false;
+bool curButtonPressed = false;
+void updateButtonStatus();
+bool isButtonPressed();
+
 #define I2S_BCK  15
 #define I2S_WS   2
 #define I2S_DATA 3
 
 bool IRAM_ATTR i2s_write_lr_nb(int16_t left, int16_t right){
-  uint32_t sample = right & 0xFFFF;
-  sample = sample << 16;
-  sample |= left & 0xFFFF;
-  return i2s_write_sample_nb(sample);
+    uint32_t sample = right & 0xFFFF;
+    sample = sample << 16;
+    sample |= left & 0xFFFF;
+    return i2s_write_sample_nb(sample);
 }
 
 #define ADC_SPI_CS   5
@@ -92,22 +112,49 @@ void setup()
 
 void loop()
 {
+    // manage MQTT connection. MUST-HAVE
     if (!client.connected())
     {
         reconnect();
     }
     client.loop();
 
-    if (bReadADC) {
-        readADC(ADC_CH, &adc[bufferN], &adc[bufferN+1]);
-        bufferN += 2;
-        if (bufferN >= ADC_BUFFER_LENGTH) {
-            bufferN = 0;
-            if (!client.publish("audioMaster", adc, ADC_BUFFER_LENGTH, false)) {
-                Serial.println("Publish failed");
-            }
+    // manage device's state
+    updateButtonStatus();
+    // if (isButtonPressed())
+    //     Serial.println("Button pressed!");
+    if (curState == SLEEP) {
+        if (isButtonPressed()) {
+            curState = CALL;
+            callBegin_ms = millis();
+            lastData_ms = millis();
         }
-        bReadADC = false;
+    } else if (curState == CALL) {
+        // send data
+        if (bReadADC) {
+            readADC(ADC_CH, &adc[bufferN], &adc[bufferN+1]);
+            bufferN += 2;
+            if (bufferN >= ADC_BUFFER_LENGTH) {
+                bufferN = 0;
+                if (!client.publish("audioMaster", adc, ADC_BUFFER_LENGTH, false)) {
+                    Serial.println("Publish failed");
+                }
+            }
+            bReadADC = false;
+        }
+
+        if (isButtonPressed() || isTimeout(callBegin_ms, CALL_TIMEOUT)) {
+            curState = TERM;
+            termBegin_ms = millis();
+        }
+        else if (isTimeout(lastData_ms, IDLE_TIMEOUT))
+            curState = SLEEP;
+
+    } else if (curState == TERM) {
+        if (isTimeout(termBegin_ms, TERM_TIMEOUT))
+            curState = SLEEP;
+    } else {
+        Serial.println("???INVALID STATE???");
     }
 }
 
@@ -161,13 +208,17 @@ void setup_wifi()
 }
 
 void callback(char* topic, byte* payload, unsigned int length) {
-    // old code
-    if (length < ADC_BUFFER_LENGTH) Serial.println("Warning: Rx length < ADC_BUFFER_LENGTH");
-    for (unsigned int i = 0; i < length; i += 2) {
-        int16_t d = payload[i];
-        d <<= 8;
-        d |= payload[i+1]; 
-        i2s_write_lr_nb(d, d);
+    if (strcmp(topic, "audioBell") == 0) {
+        if (curState == CALL) {
+            for (unsigned int i = 0; i < length; i += 2) {
+                int16_t d = payload[i];
+                d <<= 8;
+                d |= payload[i+1]; 
+                i2s_write_lr_nb(d, d);
+            }
+            // very important: update time of last packet received
+            lastData_ms = millis();
+        }
     }
 }
 
@@ -194,3 +245,17 @@ void reconnect() {
     }
   }
 } 
+
+bool isTimeout(unsigned long ms, unsigned long timeout) {
+    return millis() - ms >= timeout;
+}
+
+void updateButtonStatus() {
+    byte tmp1, tmp2;
+    prevButtonPressed = curButtonPressed;
+    curButtonPressed = readADC(BUTTON_CH, &tmp1, &tmp2) > 65000;
+}
+
+bool isButtonPressed() {
+    return curButtonPressed && !prevButtonPressed;
+}
