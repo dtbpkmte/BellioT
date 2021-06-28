@@ -92,7 +92,8 @@ Bell device:
 
 Here are some problems that I couldn't fix yet:
 - Noise: not much, but notable
-- Can't implement full protocol on ESP32: I'm getting watchdog timeout error anytime I use millis(). From my tests, I believe it is not hardware error but software. I may have missed something about millis() on ESP32 (on ESP8266 it worked perfectly).
+- ~~Can't implement full protocol on ESP32: I'm getting watchdog timeout error anytime I use millis(). From my tests, I believe it is not hardware error but software. I may have missed something about millis() on ESP32 (on ESP8266 it worked perfectly).~~
+- Sound is not good in the ESP8266 device after fixing watchdog timeout on ESP32
 
 Progress
 --------
@@ -115,6 +116,8 @@ Progress:
     - added basic feature of a bell: a button to press, with hardware debounce  
     - completed the connection protocol between master device and bell device
     - almost completed implementation on real hardware ("almost" because there's some problem on ESP32 I can't fix yet)
+- 28/06/2021:
+    - fixed watchdog timeout error on ESP32. Now both devices are working correctly according to the protocol!
 
 Credits and References
 ----------------------
