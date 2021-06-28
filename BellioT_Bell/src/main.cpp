@@ -4,6 +4,9 @@
 #include "PubSubClient.h"
 #include <WiFi.h>
 
+#define TIMER_INTERRUPT_DEBUG      0
+#include "ESP32TimerInterrupt.h"
+
 #define BUTTON_CH 1
 #define CALL_TIMEOUT 600000
 #define IDLE_TIMEOUT 40000
@@ -38,29 +41,17 @@ const i2s_port_t I2S_PORT = I2S_NUM_1;
 #define ADC_BUFFER_LENGTH 160      //so 80 16-bit samples each publish
 
 byte adc[ADC_BUFFER_LENGTH] = {0};
-volatile bool bufferFull = false;
 int bufferN = 0;
-bool bADCRead = false;
+volatile bool bReadADC = false;
 
-unsigned long start_us = 0;
-hw_timer_t * timer = NULL;
-portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
+// hw_timer_t * timer = NULL;
+// portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
 
 uint16_t readADC(byte ch, byte *e1, byte *e2);
 
+ESP32Timer ITimer1(1);
 void IRAM_ATTR onTimer() {
-    portENTER_CRITICAL_ISR(&timerMux);
-
-    if (curState == CALL && !bufferFull) {
-        readADC(ADC_CH, &adc[bufferN], &adc[bufferN+1]);
-        bufferN += 2;
-        if (bufferN >= ADC_BUFFER_LENGTH) {
-            bufferN = 0;
-            bufferFull = true;
-        }
-    }
-
-    portEXIT_CRITICAL_ISR(&timerMux);
+    bReadADC = true;
 }
 
 const char* ssid = "DESKTOP-H1E7PQR 5840";
@@ -133,12 +124,11 @@ void setup()
 
     Serial.println("I2S driver installed.");
 
-    timer = timerBegin(0, 80, true);
-    timerAttachInterrupt(timer, &onTimer, true);
-    timerAlarmWrite(timer, 125, true); //8kHz
-    timerAlarmEnable(timer);
-    Serial.println("Timer init success.");
-    
+    if (ITimer1.attachInterrupt(8000, onTimer))
+        Serial.println("Starting  ITimer1 OK, millis() = " + String(millis()));
+    else
+        Serial.println("Can't set ITimer1. Select another freq. or timer");
+        
 }
 
 void loop()
@@ -150,7 +140,7 @@ void loop()
     client.loop();
 
     // manage device's state
-    // updateButtonStatus();
+    updateButtonStatus();
     // if (isButtonPressed())
     //     Serial.println("Button pressed!");
     if (curState == SLEEP) {
@@ -161,19 +151,24 @@ void loop()
         }
     } else if (curState == CALL) {
         // send data
-        if (bufferFull) {
-            if (!client.publish("audioBell", adc, ADC_BUFFER_LENGTH, false)) {
-                Serial.println("Publish failed");
+        if (bReadADC) {
+            readADC(ADC_CH, &adc[bufferN], &adc[bufferN+1]);
+            bufferN += 2;
+            if (bufferN >= ADC_BUFFER_LENGTH) {
+                bufferN = 0;
+                if (!client.publish("audioBell", adc, ADC_BUFFER_LENGTH, false)) {
+                    Serial.println("Publish failed");
+                }
             }
-            bufferFull = false;
+            bReadADC = false;
         }
 
-        // if (isTimeout(callBegin_ms, CALL_TIMEOUT)) {
-        //     curState = TERM;
-        //     termBegin_ms = millis();
-        // }
-        // else if (isTimeout(lastData_ms, IDLE_TIMEOUT))
-        //     curState = SLEEP;
+        if (isTimeout(callBegin_ms, CALL_TIMEOUT)) {
+            curState = TERM;
+            termBegin_ms = millis();
+        }
+        else if (isTimeout(lastData_ms, IDLE_TIMEOUT))
+            curState = SLEEP;
 
     } else if (curState == TERM) {
         if (isTimeout(termBegin_ms, TERM_TIMEOUT))
@@ -247,7 +242,7 @@ void callback(char* topic, byte* payload, unsigned int length) {
                 i2s_write(I2S_PORT, &d, 4, &bw, 100);
             }
             // very important: update time of last packet received
-            // lastData_ms = millis();
+            lastData_ms = millis();
         }
     }
 }
