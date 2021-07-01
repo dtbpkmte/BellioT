@@ -60,6 +60,8 @@ MAX9814 is the sensor to record audio from the environment. The external ADC MCP
 
 Note that each device acts as both the transmitter and receiver, just like telephones.
 
+Bell device (ESP32) has a Web UI to configure WiFi and MQTT. It then stores the configuration permanently using Preferences.h library.
+
 #### Connection protocol between Master and Bell:  
 ![image](./docs/AudioCallFlow.png)
 
@@ -79,6 +81,8 @@ Note that the master device decides whether to accept a call or not. Calls have 
 - Remember to change Wifi credentials and server IP in the code to your own
 - First run a MQTT broker on Raspberry Pi:  `mosquitto -p 2883`  
 - Then power on two devices. They will publish data in topics "audioMaster" and "audioBell".
+- If Bell device is in `SETUP` mode, you need to connect to the Access Point (AP) `BellioT Bell AP` and go to `192.168.1.1` in the browser to enter Config Web UI. When finished, restart the device, and it will enter `OPERATE` mode.
+- To change already set Preferences, set `FORCE_SETUP` to 1 in main.cpp
 
 ### Demo Images
 
@@ -104,20 +108,23 @@ These are the things I want to add in the future:
 
 - Camera stream to a NodeJS server using WebSocket
 - Integrate LCD to see the camera directly from the Master device
-- Provide an UI to set up SSID and Password easily
-- Integrate EEPROM to store credentials (..is this secure?)
+- ~~Provide an UI to set up SSID and Password easily~~
+- ~~Integrate EEPROM to store credentials (..is this secure?)~~ Done by using ESP32's Preferences.h
 - Reduce noise, maybe by implementing some kind of codec
 - Integrate with a smart home network
 - Finally, design a case so that it becomes a complete product
 
 Progress:
-- 25/06/2021: completed audio transmission between bell device and master device
+- 25/06/2021: 
+    - completed audio transmission between bell device and master device
 - 27/06/2021: 
     - added basic feature of a bell: a button to press, with hardware debounce  
     - completed the connection protocol between master device and bell device
     - almost completed implementation on real hardware ("almost" because there's some problem on ESP32 I can't fix yet)
 - 28/06/2021:
     - fixed watchdog timeout error on ESP32. Now both devices are working correctly according to the protocol!
+- 01/07/2021:
+    - added Web UI to configure WiFi and MQTT
 
 Credits and References
 ----------------------
@@ -126,6 +133,7 @@ Credits and References
 - ESP8266 I2S Usage: TBA
 - ESP32 Timer Interrupt Usage: https://diyprojects.io/esp32-timers-alarms-interrupts-arduino-code/
 - PCM5102 Module Wiring: https://github.com/earlephilhower/ESP8266Audio
+- ESP32 Preferences Usage: https://randomnerdtutorials.com/esp32-save-data-permanently-preferences/
 - Libraries:
     - PubSubClient: https://github.com/knolleary/pubsubclient
     - ESP8266TimerInterrupt: https://github.com/khoih-prog/ESP8266TimerInterrupt

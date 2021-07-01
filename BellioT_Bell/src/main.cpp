@@ -3,9 +3,80 @@
 #include <SPI.h>
 #include "PubSubClient.h"
 #include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
 
 #define TIMER_INTERRUPT_DEBUG      0
 #include "ESP32TimerInterrupt.h"
+
+enum ProgramModeEnum {SETUP, OPERATE};
+typedef enum ProgramModeEnum ProgramMode;
+ProgramMode progMode = SETUP;
+
+#define CONNECT_TIMEOUT 15000
+IPAddress local_ip(192,168,1,1);
+IPAddress gateway(192,168,1,1);
+IPAddress subnet(255,255,255,0);
+WebServer setupServer(80);
+
+void handleRoot();
+void handleSuccess();
+void handleFailure();
+void handleNotFound();
+
+const char INDEX_HTML[] =
+"<!DOCTYPE HTML>"
+"<html>"
+"<head>"
+"<meta name = \"viewport\" content = \"width = device-width, initial-scale = 1.0, maximum-scale = 1.0, user-scalable=0\">"
+"<title>BellioT Setup Page</title>"
+"<style>"
+"\"body { background-color: #808080; font-family: Arial, Helvetica, Sans-Serif; Color: #000000; }\""
+"</style>"
+"</head>"
+"<body>"
+"<h1>BellioT Setup Page</h1>"
+"<form action=\"/\" method=\"post\">"
+"<label for=\"ssid\">Enter SSID:</label><br>"
+"<input type=\"text\" id=\"ssid\" name=\"ssid\"><br>"
+"<label for=\"ssid\">Enter Password:</label><br>"
+"<input type=\"text\" id=\"pw\" name=\"pw\"><br>"
+"<label for=\"ssid\">Enter IP address of MQTT Server:</label><br>"
+"<input type=\"text\" id=\"ip3\" name=\"ip3\">."
+"<input type=\"text\" id=\"ip2\" name=\"ip2\">."
+"<input type=\"text\" id=\"ip1\" name=\"ip1\">."
+"<input type=\"text\" id=\"ip0\" name=\"ip0\"><br>"
+"<label for=\"ssid\">Enter port of MQTT Server:</label><br>"
+"<input type=\"text\" id=\"port\" name=\"port\"><br>"
+"<input type=\"submit\">"
+"</form>"
+"</body>"
+"</html>";
+
+const char FAILURE_HTML[] =
+"<!DOCTYPE HTML>"
+"<html>"
+"<head>"
+"<title>Setup Failed</title>"
+"</head>"
+"<body>"
+"<h3>Wrong SSID or Password.</h3>"
+"</body>"
+"</html>";
+
+const char SUCCESS_HTML[] =
+"<!DOCTYPE HTML>"
+"<html>"
+"<head>"
+"<title>Setup Success</title>"
+"</head>"
+"<body>"
+"<h3>WiFi credentials set. Please restart the device by power off then power on again.</h3>"
+"<p>Note: MQTT server config is not checked.</p>"
+"</body>"
+"</html>";
+
+Preferences pref;
 
 #define BUTTON_CH 1
 #define CALL_TIMEOUT 600000
@@ -44,9 +115,6 @@ byte adc[ADC_BUFFER_LENGTH] = {0};
 int bufferN = 0;
 volatile bool bReadADC = false;
 
-// hw_timer_t * timer = NULL;
-// portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
-
 uint16_t readADC(byte ch, byte *e1, byte *e2);
 
 ESP32Timer ITimer1(1);
@@ -54,10 +122,14 @@ void IRAM_ATTR onTimer() {
     bReadADC = true;
 }
 
-const char* ssid = "DESKTOP-H1E7PQR 5840";
-const char* password = "qazwsxedc";
-const uint16_t mqtt_port = 2883;
-IPAddress mqtt_server(192, 168, 0, 101);
+// const char* ssid = "DESKTOP-H1E7PQR 5840";
+// const char* password = "qazwsxedc";
+// const uint16_t mqtt_port = 2883;
+// IPAddress mqtt_server(192, 168, 0, 101);
+String ssid = "";
+String password = "";
+uint16_t mqtt_port = 2883;
+IPAddress mqtt_server;
 
 WiFiClient espClient;
 PubSubClient client(espClient);
@@ -66,116 +138,246 @@ void setup_wifi();
 void callback(char* topic, byte* payload, unsigned int length); 
 void reconnect(); 
 
+#define FORCE_SETUP 0
 void setup()
 {   
     Serial.begin(115200);
 
-    /* WiFi and MQTT init */
-    setup_wifi();
-    client.setServer(mqtt_server, mqtt_port);
-    client.setCallback(callback);
-    if (!client.setBufferSize(ADC_BUFFER_LENGTH + 100)) {
-        Serial.println("Unable to set buffer size");
+    // first check if the device has already been configured
+    
+    if (FORCE_SETUP || !pref.begin("BellioT", true) || !pref.getBool("credsSet", false)) {
+        progMode = SETUP;
+    } else {
+        progMode = OPERATE;
+        ssid = pref.getString("ssid", "");
+        password = pref.getString("pw", "");
+        mqtt_server = IPAddress(pref.getUInt("ip"));
+        mqtt_port = pref.getUShort("port");
+
+        // Serial.println("Received configuration:");
+        // Serial.println("SSID: " + ssid);
+        // Serial.println("PW: " + password);
+        // Serial.print("IP: "); Serial.println(mqtt_server.toString());
+        // Serial.print("port: "); Serial.println(mqtt_port);
     }
+    pref.end();
 
-    /* SPI init */
-    pinMode(ADC_SPI_CS,OUTPUT);
-    digitalWrite(ADC_SPI_CS, HIGH);
-    SPI.setBitOrder(MSBFIRST);
-    SPI.setDataMode(SPI_MODE3);
-    SPI.begin(ADC_SPI_CLK, ADC_SPI_MISO, ADC_SPI_MOSI, ADC_SPI_CS);
+    if (progMode == SETUP) {
 
-    esp_err_t err;
+        WiFi.mode(WIFI_AP_STA);
+        WiFi.softAP("BellioT Bell AP");
+        WiFi.softAPConfig(local_ip, gateway, subnet);
 
-    const i2s_config_t i2s_config = {
-        .mode = i2s_mode_t(I2S_MODE_MASTER | I2S_MODE_TX),
-        .sample_rate = 8000,                         // 8KHz
-        .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT, 
-        .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT, 
-        .communication_format = i2s_comm_format_t(I2S_COMM_FORMAT_I2S | I2S_COMM_FORMAT_I2S_MSB),
-        .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,     
-        .dma_buf_count = 8,                           // number of buffers
-        .dma_buf_len = ADC_BUFFER_LENGTH/2,
-        .use_apll = true,
-        .tx_desc_auto_clear = true                              
-    };
+        setupServer.on("/", handleRoot);
+        setupServer.onNotFound(handleNotFound);        
 
-    // The pin config as per the setup
-    const i2s_pin_config_t pin_config = {
-        .bck_io_num = I2S_BCK,
-        .ws_io_num = I2S_WS,    
-        .data_out_num = I2S_DATA, 
-        .data_in_num = I2S_PIN_NO_CHANGE   
-    };
+        setupServer.begin();
 
-    // Configuring the I2S driver and pins.
-    // This function must be called before any I2S driver read/write operations.
-    err = i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
-    if (err != ESP_OK) {
-        Serial.printf("Failed installing driver: %d\n", err);
-        while (true);
-    }
+    } else if (progMode == OPERATE) {
 
-    err = i2s_set_pin(I2S_PORT, &pin_config);
-    if (err != ESP_OK) {
-        Serial.printf("Failed setting pin: %d\n", err);
-        while (true);
-    }
+        /* WiFi and MQTT init */
+        setup_wifi();
+        client.setServer(mqtt_server, mqtt_port);
+        client.setCallback(callback);
+        if (!client.setBufferSize(ADC_BUFFER_LENGTH + 100)) {
+            Serial.println("Unable to set buffer size");
+        }
 
-    Serial.println("I2S driver installed.");
+        /* SPI init */
+        pinMode(ADC_SPI_CS,OUTPUT);
+        digitalWrite(ADC_SPI_CS, HIGH);
+        SPI.setBitOrder(MSBFIRST);
+        SPI.setDataMode(SPI_MODE3);
+        SPI.begin(ADC_SPI_CLK, ADC_SPI_MISO, ADC_SPI_MOSI, ADC_SPI_CS);
 
-    if (ITimer1.attachInterrupt(8000, onTimer))
-        Serial.println("Starting  ITimer1 OK, millis() = " + String(millis()));
-    else
-        Serial.println("Can't set ITimer1. Select another freq. or timer");
-        
+        esp_err_t err;
+
+        const i2s_config_t i2s_config = {
+            .mode = i2s_mode_t(I2S_MODE_MASTER | I2S_MODE_TX),
+            .sample_rate = 8000,                         // 8KHz
+            .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT, 
+            .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT, 
+            .communication_format = i2s_comm_format_t(I2S_COMM_FORMAT_I2S | I2S_COMM_FORMAT_I2S_MSB),
+            .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,     
+            .dma_buf_count = 8,                           // number of buffers
+            .dma_buf_len = ADC_BUFFER_LENGTH/2,
+            .use_apll = true,
+            .tx_desc_auto_clear = true                              
+        };
+
+        // The pin config as per the setup
+        const i2s_pin_config_t pin_config = {
+            .bck_io_num = I2S_BCK,
+            .ws_io_num = I2S_WS,    
+            .data_out_num = I2S_DATA, 
+            .data_in_num = I2S_PIN_NO_CHANGE   
+        };
+
+        // Configuring the I2S driver and pins.
+        // This function must be called before any I2S driver read/write operations.
+        err = i2s_driver_install(I2S_PORT, &i2s_config, 0, NULL);
+        if (err != ESP_OK) {
+            Serial.printf("Failed installing driver: %d\n", err);
+            while (true);
+        }
+
+        err = i2s_set_pin(I2S_PORT, &pin_config);
+        if (err != ESP_OK) {
+            Serial.printf("Failed setting pin: %d\n", err);
+            while (true);
+        }
+
+        Serial.println("I2S driver installed.");
+
+        if (ITimer1.attachInterrupt(8000, onTimer))
+            Serial.println("Starting  ITimer1 OK");
+        else
+            Serial.println("Can't set ITimer1. Select another freq. or timer");
+
+    } else {
+        Serial.println("Wrong Mode");
+        while (1);
+    }        
 }
 
 void loop()
 {
-    // manage MQTT connection. MUST-HAVE
-    if (!client.connected()) {
-        reconnect();
-    }
-    client.loop();
+    if (progMode == SETUP) {
 
-    // manage device's state
-    updateButtonStatus();
-    // if (isButtonPressed())
-    //     Serial.println("Button pressed!");
-    if (curState == SLEEP) {
-        if (isButtonPressed()) {
-            curState = CALL;
-            callBegin_ms = millis();
-            lastData_ms = millis();
-        }
-    } else if (curState == CALL) {
-        // send data
-        if (bReadADC) {
-            readADC(ADC_CH, &adc[bufferN], &adc[bufferN+1]);
-            bufferN += 2;
-            if (bufferN >= ADC_BUFFER_LENGTH) {
-                bufferN = 0;
-                if (!client.publish("audioBell", adc, ADC_BUFFER_LENGTH, false)) {
-                    Serial.println("Publish failed");
-                }
-            }
-            bReadADC = false;
-        }
+        setupServer.handleClient();
 
-        if (isTimeout(callBegin_ms, CALL_TIMEOUT)) {
-            curState = TERM;
-            termBegin_ms = millis();
-        }
-        else if (isTimeout(lastData_ms, IDLE_TIMEOUT))
-            curState = SLEEP;
-
-    } else if (curState == TERM) {
-        if (isTimeout(termBegin_ms, TERM_TIMEOUT))
-            curState = SLEEP;
     } else {
-        Serial.println("???INVALID STATE???");
+
+        // manage MQTT connection. MUST-HAVE
+        if (!client.connected()) {
+            reconnect();
+        }
+        client.loop();
+
+        // manage device's state
+        updateButtonStatus();
+        // if (isButtonPressed())
+        //     Serial.println("Button pressed!");
+        if (curState == SLEEP) {
+            if (isButtonPressed()) {
+                curState = CALL;
+                callBegin_ms = millis();
+                lastData_ms = millis();
+            }
+        } else if (curState == CALL) {
+            // send data
+            if (bReadADC) {
+                readADC(ADC_CH, &adc[bufferN], &adc[bufferN+1]);
+                bufferN += 2;
+                if (bufferN >= ADC_BUFFER_LENGTH) {
+                    bufferN = 0;
+                    if (!client.publish("audioBell", adc, ADC_BUFFER_LENGTH, false)) {
+                        Serial.println("Publish failed");
+                    }
+                }
+                bReadADC = false;
+            }
+
+            if (isTimeout(callBegin_ms, CALL_TIMEOUT)) {
+                curState = TERM;
+                termBegin_ms = millis();
+            }
+            else if (isTimeout(lastData_ms, IDLE_TIMEOUT))
+                curState = SLEEP;
+
+        } else if (curState == TERM) {
+            if (isTimeout(termBegin_ms, TERM_TIMEOUT))
+                curState = SLEEP;
+        } else {
+            Serial.println("???INVALID STATE???");
+        }
     }
+}
+
+void returnFail(String msg)
+{
+    setupServer.sendHeader("Connection", "close");
+    setupServer.sendHeader("Access-Control-Allow-Origin", "*");
+    setupServer.send(500, "text/plain", msg + "\r\n");
+}
+
+void handleSubmit()
+{
+    String t_ssid, t_pw;
+
+    t_ssid = setupServer.arg("ssid");
+    t_pw = setupServer.arg("pw");
+
+    // Serial.println("Received configuration:");
+    // Serial.println("SSID: " + value1);
+    // Serial.println("PW: " + value2);
+
+    uint32_t t_ip;
+    t_ip = setupServer.arg("ip3").toInt();
+    t_ip |= setupServer.arg("ip2").toInt() << 8;
+    t_ip |= setupServer.arg("ip1").toInt() << 16;
+    t_ip |= setupServer.arg("ip0").toInt() << 24;
+
+    // Serial.print("IP: "); Serial.println(ip);
+    // Serial.print("port: "); Serial.println((uint16_t) setupServer.arg("port").toInt());
+
+    // try if the credentials are correct
+    WiFi.begin(t_ssid.c_str(), t_pw.c_str());
+    unsigned long beginConn = millis();
+    while (WiFi.status() != WL_CONNECTED) {
+        if (isTimeout(beginConn, CONNECT_TIMEOUT)) {
+            setupServer.send(200, "text/html", FAILURE_HTML);
+            return;
+        }
+    }
+
+    // save configurations
+    pref.begin("BellioT", false);
+    pref.putString("ssid", t_ssid);
+    pref.putString("pw", t_pw);
+    pref.putUInt("ip", t_ip);
+    pref.putUShort("port", setupServer.arg("port").toInt());
+    pref.putBool("credsSet", true);
+    pref.end();
+
+    setupServer.send(200, "text/html", SUCCESS_HTML);
+}
+
+void returnOK()
+{
+    setupServer.sendHeader("Connection", "close");
+    setupServer.sendHeader("Access-Control-Allow-Origin", "*");
+    setupServer.send(200, "text/plain", "OK\r\n");
+}
+
+void handleRoot()
+{
+    if (setupServer.hasArg("ssid") && 
+        setupServer.hasArg("pw") && 
+        setupServer.hasArg("ip3") && setupServer.hasArg("ip2") && setupServer.hasArg("ip1") && setupServer.hasArg("ip0") && 
+        setupServer.hasArg("port")) {
+
+        handleSubmit();
+    }
+    else {
+        setupServer.send(200, "text/html", INDEX_HTML);
+    }
+}
+
+void handleNotFound()
+{
+    String message = "File Not Found\n\n";
+    message += "URI: ";
+    message += setupServer.uri();
+    message += "\nMethod: ";
+    message += (setupServer.method() == HTTP_GET)?"GET":"POST";
+    message += "\nArguments: ";
+    message += setupServer.args();
+    message += "\n";
+    for (uint8_t i=0; i<setupServer.args(); i++){
+        message += " " + setupServer.argName(i) + ": " + setupServer.arg(i) + "\n";
+    }
+    setupServer.send(404, "text/plain", message);
 }
 
 uint16_t readADC(byte ch, byte *e1, byte *e2)
@@ -210,7 +412,7 @@ void setup_wifi() {
     Serial.println(ssid);
 
     WiFi.mode(WIFI_STA);
-    WiFi.begin(ssid, password);
+    WiFi.begin(ssid.c_str(), password.c_str());
 
     while (WiFi.status() != WL_CONNECTED) {
         delay(500);
