@@ -125,6 +125,10 @@ Progress:
     - fixed watchdog timeout error on ESP32. Now both devices are working correctly according to the protocol!
 - 01/07/2021:
     - added Web UI to configure WiFi and MQTT
+- 07/07/2021:
+    - switched from [PubSubClient](https://github.com/knolleary/pubsubclient) to [this MQTT library](https://github.com/256dpi/arduino-mqtt) to publish QoS > 0 messages
+    - started working on integrating with [dshn](https://github.com/dtbpkmte/dshn)
+    - spotted new error: ESP8266 can't play audio well
 
 Credits and References
 ----------------------
@@ -136,4 +140,5 @@ Credits and References
 - ESP32 Preferences Usage: https://randomnerdtutorials.com/esp32-save-data-permanently-preferences/
 - Libraries:
     - PubSubClient: https://github.com/knolleary/pubsubclient
+    - MQTT: https://github.com/256dpi/arduino-mqtt
     - ESP8266TimerInterrupt: https://github.com/khoih-prog/ESP8266TimerInterrupt

@@ -1,14 +1,17 @@
 #include <Arduino.h>
 #include <driver/i2s.h>
 #include <SPI.h>
-#include "PubSubClient.h"
 #include <WiFi.h>
 #include <WebServer.h>
 #include <Preferences.h>
+#include <WebSocketsClient.h>
+#include <MQTT.h> 
+
 
 #define TIMER_INTERRUPT_DEBUG      0
 #include "ESP32TimerInterrupt.h"
 
+// program modes
 enum ProgramModeEnum {SETUP, OPERATE};
 typedef enum ProgramModeEnum ProgramMode;
 ProgramMode progMode = SETUP;
@@ -19,6 +22,7 @@ IPAddress gateway(192,168,1,1);
 IPAddress subnet(255,255,255,0);
 WebServer setupServer(80);
 
+// web UI
 void handleRoot();
 void handleSuccess();
 void handleFailure();
@@ -78,6 +82,7 @@ const char SUCCESS_HTML[] =
 
 Preferences pref;
 
+// call protocol
 #define BUTTON_CH 1
 #define CALL_TIMEOUT 600000
 #define IDLE_TIMEOUT 40000
@@ -98,12 +103,14 @@ bool curButtonPressed = false;
 void updateButtonStatus();
 bool isButtonPressed();
 
+// i2s
 #define I2S_BCK  16
 #define I2S_WS   15
 #define I2S_DATA 13
 
 const i2s_port_t I2S_PORT = I2S_NUM_1;
 
+// adc
 #define ADC_SPI_CS   12
 #define ADC_SPI_MISO 2
 #define ADC_SPI_MOSI 0
@@ -117,11 +124,7 @@ volatile bool bReadADC = false;
 
 uint16_t readADC(byte ch, byte *e1, byte *e2);
 
-ESP32Timer ITimer1(1);
-void IRAM_ATTR onTimer() {
-    bReadADC = true;
-}
-
+// network
 // const char* ssid = "DESKTOP-H1E7PQR 5840";
 // const char* password = "qazwsxedc";
 // const uint16_t mqtt_port = 2883;
@@ -132,11 +135,30 @@ uint16_t mqtt_port = 2883;
 IPAddress mqtt_server;
 
 WiFiClient espClient;
-PubSubClient client(espClient);
+MQTTClient client(ADC_BUFFER_LENGTH + 100);
 
 void setup_wifi(); 
-void callback(char* topic, byte* payload, unsigned int length); 
-void reconnect(); 
+void reconnect();
+void onMqttMessage(MQTTClient *client, char topic[], char payload[], int length);
+
+// camera
+#define CAMERA_MODEL_AI_THINKER
+#include "camera_pins.h"
+#include "esp_camera.h"
+
+WebSocketsClient webSocket;
+void webSocketEvent(WStype_t type, uint8_t * payload, size_t length);
+
+volatile int cameraCounter = 0;
+volatile bool bSendCamera = false;
+ESP32Timer ITimer1(1);
+void IRAM_ATTR onTimer() {
+    bReadADC = true;
+    if (++cameraCounter >= 500) { //16 FPS
+        bSendCamera = true;
+        cameraCounter = 0;
+    }
+}
 
 #define FORCE_SETUP 0
 void setup()
@@ -177,11 +199,10 @@ void setup()
 
         /* WiFi and MQTT init */
         setup_wifi();
-        client.setServer(mqtt_server, mqtt_port);
-        client.setCallback(callback);
-        if (!client.setBufferSize(ADC_BUFFER_LENGTH + 100)) {
-            Serial.println("Unable to set buffer size");
-        }
+        client.begin(mqtt_server, mqtt_port, espClient);
+        client.onMessageAdvanced(onMqttMessage);
+        client.setWill("Status", "BellioT-Bell/DISCONNECT", false, 1);
+        reconnect();
 
         /* SPI init */
         pinMode(ADC_SPI_CS,OUTPUT);
@@ -234,6 +255,44 @@ void setup()
         else
             Serial.println("Can't set ITimer1. Select another freq. or timer");
 
+        // camera init
+        // camera_config_t config;
+        // config.ledc_channel = LEDC_CHANNEL_0;
+        // config.ledc_timer = LEDC_TIMER_0;
+        // config.pin_d0 = Y2_GPIO_NUM;
+        // config.pin_d1 = Y3_GPIO_NUM;
+        // config.pin_d2 = Y4_GPIO_NUM;
+        // config.pin_d3 = Y5_GPIO_NUM;
+        // config.pin_d4 = Y6_GPIO_NUM;
+        // config.pin_d5 = Y7_GPIO_NUM;
+        // config.pin_d6 = Y8_GPIO_NUM;
+        // config.pin_d7 = Y9_GPIO_NUM;
+        // config.pin_xclk = XCLK_GPIO_NUM;
+        // config.pin_pclk = PCLK_GPIO_NUM;
+        // config.pin_vsync = VSYNC_GPIO_NUM;
+        // config.pin_href = HREF_GPIO_NUM;
+        // config.pin_sscb_sda = SIOD_GPIO_NUM;
+        // config.pin_sscb_scl = SIOC_GPIO_NUM;
+        // config.pin_pwdn = PWDN_GPIO_NUM;
+        // config.pin_reset = RESET_GPIO_NUM;
+        // config.xclk_freq_hz = 20000000;
+        // config.pixel_format = PIXFORMAT_JPEG;
+        
+        // config.frame_size = FRAMESIZE_VGA;
+        // config.jpeg_quality = 10;
+        // config.fb_count = 1;
+
+        // err = esp_camera_init(&config);
+        // if (err != ESP_OK) {
+        //     Serial.printf("Camera init failed with error 0x%x", err);
+        //     while (1);
+        // }
+
+        // webSocket.begin(mqtt_server, 3000, "/jpgstream_server");
+        // webSocket.onEvent(webSocketEvent);
+        // webSocket.setReconnectInterval(5000);
+        // webSocket.enableHeartbeat(15000, 3000, 2); 
+
     } else {
         Serial.println("Wrong Mode");
         while (1);
@@ -243,16 +302,16 @@ void setup()
 void loop()
 {
     if (progMode == SETUP) {
-
         setupServer.handleClient();
-
     } else {
-
-        // manage MQTT connection. MUST-HAVE
-        if (!client.connected()) {
+        if (!client.connected())
+        {
             reconnect();
         }
         client.loop();
+
+        // manage WebSocket
+        // webSocket.loop();
 
         // manage device's state
         updateButtonStatus();
@@ -271,12 +330,26 @@ void loop()
                 bufferN += 2;
                 if (bufferN >= ADC_BUFFER_LENGTH) {
                     bufferN = 0;
-                    if (!client.publish("audioBell", adc, ADC_BUFFER_LENGTH, false)) {
-                        Serial.println("Publish failed");
-                    }
+                    if (!client.publish("audioBell", (char *) adc, ADC_BUFFER_LENGTH))
+                        Serial.println("publish failed");
                 }
                 bReadADC = false;
             }
+            // if (bSendCamera) {
+            //     camera_fb_t * fb = NULL;
+
+            //     // Take Picture with Camera
+            //     fb = esp_camera_fb_get();  
+            //     if (!fb) {
+            //         Serial.println("Camera capture failed");
+            //         return;
+            //     }
+                
+            //     webSocket.sendBIN(fb->buf,fb->len);
+            //     esp_camera_fb_return(fb); 
+
+            //     bSendCamera = false;
+            // }
 
             if (isTimeout(callBegin_ms, CALL_TIMEOUT)) {
                 curState = TERM;
@@ -291,6 +364,7 @@ void loop()
         } else {
             Serial.println("???INVALID STATE???");
         }
+        
     }
 }
 
@@ -419,15 +493,38 @@ void setup_wifi() {
         Serial.print(".");
     }
 
-    randomSeed(micros());
-
     Serial.println("");
     Serial.println("WiFi connected");
     Serial.println("IP address: ");
     Serial.println(WiFi.localIP());
 }
 
-void callback(char* topic, byte* payload, unsigned int length) {
+void reconnect() {
+    Serial.print("checking wifi...");
+    while (WiFi.status() != WL_CONNECTED) {
+        Serial.print(".");
+        delay(1000);
+    }
+
+    Serial.print("\nconnecting...");
+    while (!client.connect("BellioT-Bell", nullptr, nullptr)) {
+        Serial.print(".");
+        delay(1000);
+    }
+
+    Serial.println("\nconnected!");
+
+    Serial.println("Trying to subscribe...");
+    while (!client.subscribe("audioMaster")) {
+        Serial.println(".");
+        delay(500);
+    }
+
+    // notify server
+    client.publish("Status", "BellioT-Bell/CONNECT", false, 1);
+}
+
+void onMqttMessage(MQTTClient *client, char topic[], char payload[], int length) {
     if (strcmp(topic, "audioMaster") == 0) {
         if (curState == SLEEP) {
             curState = CALL;
@@ -449,30 +546,6 @@ void callback(char* topic, byte* payload, unsigned int length) {
     }
 }
 
-void reconnect() {
-  // Loop until we're reconnected
-  while (!client.connected()) {
-    Serial.print("Attempting MQTT connection...");
-    // Create a random client ID
-    String clientId = "BellIot_BELL-";
-    clientId += String(random(0xffff), HEX);
-    // Attempt to connect
-    if (client.connect(clientId.c_str())) {
-        Serial.println("connected");
-        // Once connected, publish an announcement...
-        client.publish("status", "connected");
-        // ... and resubscribe
-        client.subscribe("audioMaster");
-    } else {
-        Serial.print("failed, rc=");
-        Serial.print(client.state());
-        Serial.println(" try again in 5 seconds");
-        // Wait 5 seconds before retrying
-        delay(5000);
-    }
-  }
-}
-
 bool isTimeout(unsigned long ms, unsigned long timeout) {
     return millis() - ms >= timeout;
 }
@@ -486,3 +559,31 @@ void updateButtonStatus() {
 bool isButtonPressed() {
     return curButtonPressed && !prevButtonPressed;
 }
+
+// void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
+
+//   switch(type) {
+//     case WStype_DISCONNECTED:
+//       Serial.printf("[WSc] Disconnected!\n");
+//       break;
+//     case WStype_CONNECTED: {
+//       Serial.printf("[WSc] Connected to url: %s\n", payload);
+//     }
+//       break;
+//     case WStype_TEXT:
+//       Serial.printf("[WSc] get text: %s\n", payload);
+//       break;
+//     case WStype_BIN:
+//       Serial.printf("[WSc] get binary length: %u\n", length);
+//       break;
+//     case WStype_PING:
+//         // pong will be send automatically
+//         Serial.printf("[WSc] get ping\n");
+//         break;
+//     case WStype_PONG:
+//         // answer to a ping we send
+//         Serial.printf("[WSc] get pong\n");
+//         break;
+//     }
+
+// }
